@@ -650,7 +650,7 @@ class lt2circuiTikz:
             attr = self.lastAttributesDict[attrkind];
             attr.value = attrval;
 
-        if (attrval != "*"):
+        if (attrval != "*") and not attr.hidden:
             attr.visible = True;
         self.lastAttributesDict[attr.kind] = attr;
         return; 
@@ -670,7 +670,7 @@ class lt2circuiTikz:
             attr = self.lastAttributesDict[attrkind];
             attr.value = attrval;
         
-        if (attrval != "*"):
+        if (attrval != "*") and not attr.hidden:
             attr.visible = True;
         self.lastAttributesDict[attr.kind] = attr;
         return; 
@@ -686,7 +686,7 @@ class lt2circuiTikz:
             attr = self.lastAttributesDict[attrkind];
             attr.value = attrval;
 
-        if (attrval != "*"):
+        if (attrval != "*") and not attr.hidden:
             attr.visible = True;
         self.lastAttributesDict[attr.kind] = attr;
         return; 
@@ -728,7 +728,8 @@ class lt2circuiTikz:
         else: # create new
             attr = Attribute(attrkind, 'undefined');
         
-        attr.visible = True;
+        attr.hidden = (m.group(4).lower() == 'invisible');
+        attr.visible = not attr.hidden;
         attr.idnum = m.group(1);
         attr.x1rel = int(m.group(2));
         attr.y1rel = int(m.group(3));
@@ -885,6 +886,104 @@ class lt2circuiTikz:
             hdestination.write(line);
         fhs.close();               
     
+    # ---- net label placement -------------------------------------------------------------------------
+    # Candidate placements, in order of preference. (dx, dy) point from the node into the label's quadrant in
+    # LTspice coordinates (y grows downwards); 'anchor' is the TikZ anchor of the label node that puts the
+    # text into that quadrant.
+    labelCandidates = [
+        ('NE', +1, -1, 'south west'),
+        ('SE', +1, +1, 'north west'),
+        ('NW', -1, -1, 'south east'),
+        ('SW', -1, +1, 'north east'),
+    ];
+    netlabel_char_width_cm = 0.20; # rough text size used only to find a free quadrant
+    netlabel_height_cm = 0.45;
+    netlabel_comp_margin = 12; # LT units added around a component's pins to approximate its body
+    
+    def _lengthToCm(self, s, default=0.1411):
+        m = re.match(r'^\s*([-\d\.]+)\s*(pt|bp|mm|cm|in)?\s*$', str(s));
+        if (m == None):
+            return default;
+        f = {'pt':0.0351459804, 'bp':0.0352777778, 'mm':0.1, 'cm':1.0, 'in':2.54, None:0.0351459804}[m.group(2)];
+        return float(m.group(1))*f;
+    
+    @staticmethod
+    def _segHitsRect(a, b, r):
+        # Liang-Barsky segment/axis-aligned-rectangle test
+        x0, y0, x1, y1 = r;
+        dx = b[0]-a[0]; dy = b[1]-a[1];
+        t0 = 0.0; t1 = 1.0;
+        for p, q in ((-dx, a[0]-x0), (dx, x1-a[0]), (-dy, a[1]-y0), (dy, y1-a[1])):
+            if (p == 0):
+                if (q < 0):
+                    return False;
+            else:
+                t = q/p;
+                if (p < 0):
+                    if (t > t1): return False;
+                    if (t > t0): t0 = t;
+                else:
+                    if (t < t0): return False;
+                    if (t < t1): t1 = t;
+        return True;
+    
+    @staticmethod
+    def _rectsOverlap(r, q):
+        return (r[0] < q[2]) and (q[0] < r[2]) and (r[1] < q[3]) and (q[1] < r[3]);
+    
+    def _collectObstacles(self):
+        """Wire segments and rough component bounding boxes in LTspice coordinates.
+        Call after wiresToPolyWires so that joined wires are already their final polylines."""
+        segs = [];
+        for w in self.circDict.wireDict.values():
+            pts = [w.getP1Tuple()];
+            if (type(w) is PolyWire):
+                pts.extend(zip(w.xn, w.yn));
+            pts.append(w.getP2Tuple());
+            for a, b in zip(pts, pts[1:]):
+                segs.append((a, b));
+        pinsByComp = {};
+        for pp, comps in self.circDict.coordCompPinDict.items():
+            for uid in comps:
+                pinsByComp.setdefault(uid, []).append(pp);
+        boxes = [];
+        mg = self.netlabel_comp_margin;
+        for uid, pts in pinsByComp.items():
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts];
+            boxes.append((min(xs)-mg, min(ys)-mg, max(xs)+mg, max(ys)+mg));
+        return segs, boxes;
+    
+    def _placeNetLabels(self, netlabel_distance):
+        """Choose for every net label the diagonal quadrant (up-right, down-right, up-left, down-left of its node)
+        that is free of wires, component bodies and already placed labels, and store the matching TikZ anchor in
+        label.anchor. In a diagonal quadrant the label box only touches the node at its corner, so wires leaving
+        the node horizontally or vertically cannot run through the text."""
+        segs, boxes = self._collectObstacles();
+        gap = self._lengthToCm(netlabel_distance)/self.lt2tscale; # inner sep in LT units
+        placed = [];
+        pad = 1.0;
+        labels = [];
+        for pp, labeldict in self.circDict.coordLabelDict.items():
+            labels.extend(labeldict.values());
+        for label in labels:
+            x = label.x1; y = label.y1;
+            tw = max(len(label.label), 1)*self.netlabel_char_width_cm/self.lt2tscale;
+            th = self.netlabel_height_cm/self.lt2tscale;
+            best = None;
+            for rank, (name, dx, dy, anchor) in enumerate(self.labelCandidates):
+                xa = x + dx*gap; xb = x + dx*(gap+tw);
+                ya = y + dy*gap; yb = y + dy*(gap+th);
+                rect = (min(xa, xb)-pad, min(ya, yb)-pad, max(xa, xb)+pad, max(ya, yb)+pad);
+                hits = sum(1 for a, b in segs if self._segHitsRect(a, b, rect));
+                hits += sum(1 for bx in boxes if self._rectsOverlap(rect, bx));
+                hits += sum(1 for q in placed if self._rectsOverlap(rect, q));
+                score = hits*10 + rank; # preference order breaks ties
+                if (best == None) or (score < best[0]):
+                    best = (score, name, anchor, rect);
+            label.anchor = best[2];
+            placed.append(best[3]);
+            print('Net label \"'+label.label+'\" at '+str((x, y))+' placed '+best[1]+' (anchor='+best[2]+', conflicts='+str(best[0]//10)+').');
+    
     def writeCircuiTikz(self, outfile):
         print('Writing Tex commands to "'+outfile+'"...')
         xscale = 1 * self.lt2tscale;
@@ -911,6 +1010,18 @@ class lt2circuiTikz:
         if (self.config.has_option('general','bipoles_length')):
             bipoles_length = self.config.get('general','bipoles_length');
             fhd.write(r'\ctikzset{bipoles/length='+bipoles_length+'}\n');
+
+        # Override in lt2ti.ini [general] with label_distance / annotation_distance
+        label_distance = '4pt';
+        annotation_distance = '4pt';
+        if (self.config.has_option('general','label_distance')):
+            label_distance = self.config.get('general','label_distance');
+        if (self.config.has_option('general','annotation_distance')):
+            annotation_distance = self.config.get('general','annotation_distance');
+        if (label_distance.strip() != ''):
+            fhd.write(r'\ctikzset{label distance='+label_distance+'}\n');
+        if (annotation_distance.strip() != ''):
+            fhd.write(r'\ctikzset{annotation distance='+annotation_distance+'}\n');
         
 
         
@@ -989,9 +1100,20 @@ class lt2circuiTikz:
         
         
         # output labels
+        # Override in lt2ti.ini [general] with netlabel_distance (any TeX length)
+        netlabel_distance = '4pt';
+        if (self.config.has_option('general','netlabel_distance')):
+            netlabel_distance = self.config.get('general','netlabel_distance');
+        # Override in lt2ti.ini [general] with netlabel_placement = template to keep the placement from the asy2tex template
+        netlabel_placement = 'diagonal';
+        if (self.config.has_option('general','netlabel_placement')):
+            netlabel_placement = self.config.get('general','netlabel_placement').strip().lower();
+        if (netlabel_placement == 'diagonal'):
+            self._placeNetLabels(netlabel_distance);
         for pp, labeldict in self.circDict.coordLabelDict.items():
             for l, label in labeldict.items():
                 label.circuitDict = self.circDict;
+                label.netlabeldist = netlabel_distance;
                 
                 texlines = label.translateToLatex({}); # ToDo: apply xoffset, yoffset (currently not in use)
                 
@@ -1299,6 +1421,7 @@ class Attribute:
         self.x2rel = 0;
         self.y2rel = 0;
         self.visible = False;
+        self.hidden = False;
         self.kind = kind;
         self.rot = 0;
         self.idnum = 0;
@@ -1624,10 +1747,25 @@ class Component(SchObject):
             res = res + indent+'    '+'component symbol:'+self.symbol.asString(indent+'    ');
         return res;
 
+    def _attrIsHidden(self, kind):
+        for attr in (self.attrlist):
+            if (str.lower(attr.kind) == str.lower(kind)):
+                return attr.hidden;
+        return False;
+
+    def _attrStrToAttr(self, match):
+        kinds = {'name':'InstName', 'value':'Value', 'value2':'Value2'};
+        attr = match.group(1);
+        if (attr in kinds) and self._attrIsHidden(kinds[attr]):
+            return '';
+        return super()._attrStrToAttr(match);
+
     def _mergeAttrStrToAttr(self, match):
         m = match.group(1)
         for attr in (self.attrlist):
             if (attr.kind == m) or (str.lower(attr.kind) == str.lower(m)):
+                if attr.hidden:
+                    return '';
                 return attr.value
         av = self.symbol.attributes.get(m, "")
         if (av != ""):
@@ -1752,6 +1890,8 @@ class Component(SchObject):
 
         line = self._mirrorReplace(line, opt)
         
+        if (any(a.hidden for a in self.attrlist)):
+            line = re.sub(r'\$\s*\$', '', line); 
         
         print('Converted tex line "'+line1.replace('\n','')+'"\n'+
               ' to                "'+line.replace('\n','')+'"');
@@ -1873,6 +2013,102 @@ class SchText(SchObject):
         
 
     
+def modifyNodeOptions(line, modifier):
+    """Run modifier(optstring)->optstring on the option list of every TikZ node that has text in a tex line.
+    Lines whose option list does not close on the same line are left untouched.
+    Marker nodes without text (e.g. node[circ]{}) are skipped."""
+    reNode = re.compile(r'\bnode\s*(?:\([^)]*\)\s*)?\[');
+    reEmptyNode = re.compile(r'\s*(?:\([^)]*\)\s*)?(?:at\s*\([^)]*\)\s*)?\{\s*\}');
+    res = '';
+    pos = 0; # everything before pos has been copied to res
+    scan = 0; # where to look for the next node
+    while True:
+        m = reNode.search(line, scan);
+        if (m == None):
+            break;
+        i = m.end(); # first char inside the option brackets
+        depth = 1; # [] nesting
+        braces = 0; # {} nesting
+        j = i;
+        while (j < len(line)) and (depth > 0):
+            ch = line[j];
+            if (ch == '{'):
+                braces += 1;
+            elif (ch == '}'):
+                braces -= 1;
+            elif (braces == 0) and (ch == '['):
+                depth += 1;
+            elif (braces == 0) and (ch == ']'):
+                depth -= 1;
+            j += 1;
+        if (depth != 0): # unterminated on this line, leave it alone
+            break;
+        close = j-1; # index of the matching ]
+        if (reEmptyNode.match(line, close+1) != None): # marker node without text: nothing to do
+            scan = close;
+            continue;
+        res += line[pos:i] + modifier(line[i:close]);
+        pos = close;
+        scan = close;
+    return res + line[pos:];
+
+def _splitTopLevelOptions(opts):
+    """Split a TikZ option string at commas that are not inside {} or []."""
+    parts = []; cur = ''; braces = 0; brackets = 0;
+    for ch in opts:
+        if (ch == '{'): braces += 1;
+        elif (ch == '}'): braces -= 1;
+        elif (ch == '[') and (braces == 0): brackets += 1;
+        elif (ch == ']') and (braces == 0): brackets -= 1;
+        if (ch == ',') and (braces == 0) and (brackets == 0):
+            parts.append(cur); cur = '';
+        else:
+            cur += ch;
+    parts.append(cur);
+    return parts;
+
+def addNodeInnerSep(line, dist):
+    """Append 'inner sep=<dist>' to the option list of every TikZ node in a tex line.
+    This is what keeps a node's text away from the point (wire end) it is anchored at.
+    Appended last so it wins over any inner sep set by the template."""
+    if (dist == None) or (str(dist).strip() == ''):
+        return line;
+    def mod(opts):
+        stripped = opts.rstrip();
+        sep = '' if ((stripped == '') or stripped.endswith(',')) else ',';
+        return stripped + sep + 'inner sep=' + str(dist).strip();
+    return modifyNodeOptions(line, mod);
+
+reNodePosOpt = re.compile(r'^\s*(anchor\s*=.*|(above|below|left|right)(\s+(above|below|left|right))?(\s*=.*)?)\s*$');
+reNodePosOfOpt = re.compile(r'^\s*(above|below|left|right)(\s+(above|below|left|right))?\s*=.*?\bof\s+(.+?)\s*$'); # e.g. above=-0.24cm of Vx
+
+def setNodeAnchor(line, anchor):
+    """Force 'anchor=<anchor>' on every TikZ node with text in a tex line, dropping any anchor / above / below /
+    left / right option the template set, since those would fight with the anchor.
+    anchor='south west' puts the text up and to the right of the node coordinate, and so on.
+    A positioning option of the form 'above=<dist> of <name>' also supplied the node's position, so it is
+    replaced by 'at={(<name>)}' to keep the node where the named reference node is."""
+    if (anchor == None) or (str(anchor).strip() == ''):
+        return line;
+    def mod(opts):
+        keep = [];
+        atname = None;
+        for o in _splitTopLevelOptions(opts):
+            if (o.strip() == ''):
+                continue;
+            mo = reNodePosOfOpt.match(o);
+            if (mo != None):
+                atname = mo.group(4);
+                continue;
+            if (reNodePosOpt.match(o) != None):
+                continue;
+            keep.append(o);
+        if (atname != None):
+            keep.append('at={('+atname+')}');
+        keep.append('anchor=' + str(anchor).strip());
+        return ','.join(keep);
+    return modifyNodeOptions(line, mod);
+
 class NetLabel(SchObject):
     def __init__(self, label, x1, y1):
         super().__init__('netlabel', x1, y1);
@@ -1882,6 +2118,8 @@ class NetLabel(SchObject):
         self.y1 = y1;
         self.attrlist = [];
         self.symbol = None;
+        self.netlabeldist = ''; 
+        self.anchor = None; # set by lt2circuiTikz._placeNetLabels; None = leave placement to the template
         
     def _toLatexReplace(self, line, opt):
         # pattern, repl, string)
@@ -1903,6 +2141,8 @@ class NetLabel(SchObject):
         
         line = self._mirrorReplace(line, opt);
         
+        line = addNodeInnerSep(line, self.netlabeldist);
+        line = setNodeAnchor(line, self.anchor);
         
         print('Converted tex line "'+line1.replace('\n','')+'"\n'+
               ' to                "'+line.replace('\n','')+'"');
