@@ -3,7 +3,7 @@ TexOrigin 0 0 0 False
 SymOrigin 0 0 0 False
 BeginPinList
 EndPinList
-TexElementName *pC
+TexElementName *cC
 BeginTex
-  \draw (#B:x1#, #B:y1#) to[#self.symbol.latexElementName#, l^=#self.name#, a_=#self.value#, #B:junction#-#A:junction#, ##options##] (#A:x1#,#A:y1#){};  %\node [] at (#self.texx1#,#self.texy1#) {x};
+  \draw (#A:x1#, #A:y1#) to[#self.symbol.latexElementName#, l^=#self.name#, a_=#self.value#, #B:junction#-#A:junction#, ##options##] (#B:x1#,#B:y1#){};  %\node [] at (#self.texx1#,#self.texy1#) {x};
 EndTex
