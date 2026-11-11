@@ -2575,9 +2575,7 @@ def main():
     
     l2tobj = lt2circuiTikz();
     l2tobj.readASCFile(args.file);
-    l2tobj.writeCircuiTikz(args.file+'.tex');    
-    
-
+    l2tobj.writeCircuiTikz(args.file.removesuffix('.asc')+'.tex');    
 
 isstandalone = False;
 try:
